@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+function throw() {
+    local message=${1:-}
+
+    [[ -n ${message} ]] \
+        && printf 'ERROR: %s\n' "${message}"
+
+    exit 1
+}
+
+function print_help() {
+    cat <<EOF
+usage: nixmaker build|list -f <flake-url> -d <path>
+
+nixmaker build --flake sample/ --directory /tmp
+: build tarballs
+
+nixmaker list --flake sample/ --directory /tmp
+: list hosts to build
+EOF
+    throw
+}
+
+function get_hosts() {
+    local flake=${1}
+
+    local out=
+
+    out=$(nix flake show --json -- "${flake}" \
+        | jq --raw-output --monochrome-output '.nixosConfigurations')
+
+    if [[ ${out} != null ]]; then
+        jq --raw-output --monochrome-output 'keys[]' <<< ${out}
+    fi
+}
+
+action=
+directory='.'
+flake='.'
+verbose=0
+
+while [[ "${#}" -gt 0 ]]; do
+    i=${1}; shift 1
+
+    case "${i}" in
+        --help)
+          print_help
+          ;;
+        build|list)
+          action=${i}
+          ;;
+        --flake|-f)
+          flake=${1}; shift 1
+          ;;
+        --dir|--directory|-d)
+          directory=${1}; shift 1
+          ;;
+        --verbose|-v|-vv|-vvv|-vvvv|-vvvvv)
+          verbose=1
+          ;;
+        *)
+          throw 'wrong option'
+          ;;
+    esac
+done
+
+if version=$(nix --version); then
+    if [[ ${version} =~ .*\ ([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        if  [[ ${BASH_REMATCH[1]} -lt 2 || ${BASH_REMATCH[1]} == 2 && ${BASH_REMATCH[2]} -lt 17 ]]; then
+            throw 'run it with more current nix - execute: nix shell nixpkgs#nix'
+        fi
+    else
+      throw 'unable to parse nix version number'
+    fi
+else
+    throw 'nix is required'
+fi
+
+if [[ ${action} == build ]]; then
+    hosts=$(get_hosts "${flake}")
+
+    IFS=$'\n' names=(${hosts})
+
+    >&2 printf 'to build: %s hosts\n' "${#names[@]}"
+
+    args=(--extra-experimental-features flakes --extra-experimental-features nix-command)
+
+    [[ ${verbose} == 1 ]] \
+        && args+=(--verbose)
+
+    for name in "${names[@]}"; do
+        >&2 printf 'building: "%s"\n' "${name}"
+
+        if ! result=$(nix "${args[@]}" build --refresh --no-link --print-out-paths -- "${flake}#nixosConfigurations.${name}.config.system.build.toplevel"); then
+            >&2 printf 'error when building "%s", skip the host\n' "${name}"
+            continue
+        fi
+
+        if ! path=$(nix-store -q --deriver -- "${result}"); then
+            >&2 printf 'unable to finish "%s", unable to deriver result "%s", skip the host\n' "${result}" "${result}"
+            continue
+        fi
+
+        destination=$(mktemp -d)
+
+        >&2 printf 'building: "%s": copy to: "%s"\n' "${name}" "${destination}"
+
+        if ! nix "${args[@]}" copy "${path}" --to "${destination}"; then
+            >&2 printf 'unable to copy host "%s" to destination "%s", skip the host\n' "${name}" "${destination}"
+
+            rm -r -- "${destination}"
+        fi
+
+        parent="${directory}/${name}"
+        compressed="${directory}/${name}/${name}.tar.gz"
+        meta="${directory}/${name}/meta"
+
+        [[ ! -d ${parent} ]] \
+            && mkdir -p -- "${parent}"
+
+        >&2 printf 'building: "%s": compressing to: "%s"\n' "${name}" "${compressed}"
+
+        tar -czf "${compressed}" -C "${destination}" nix
+
+        printf '%s\n%s\n' "${path}" "${result}" > "${meta}"
+
+        rm -r -- "${destination}"
+    done
+elif [[ ${action} == list ]]; then
+    get_hosts "${flake}"
+else
+    print_help
+fi
